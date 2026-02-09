@@ -1,0 +1,5 @@
+# === Python 3.11 Compatible Dependencies ===
+
+streamlit
+requests
+python-dotenv

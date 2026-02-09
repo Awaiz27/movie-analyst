@@ -1,0 +1,72 @@
+# ══════════════════════════════════════════════
+#  Movie Analyst Agent — .gitignore
+# ══════════════════════════════════════════════
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.whl
+
+# ── Virtual Environments ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── Environment Variables ──
+.env
+.env.*
+!.env.example
+
+# ── IDE / Editors ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ── OS Files ──
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Database ──
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Logs ──
+*.log
+logs/
+
+# ── Data (local runtime) ──
+data/
+frontend/data/
+
+# ── Docker ──
+docker-compose.override.yml
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+test.ipynb
+
+# ── Pytest / Coverage ──
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Misc ──
+*.bak
+*.tmp
+*.temp

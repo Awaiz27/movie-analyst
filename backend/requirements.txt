@@ -1,0 +1,36 @@
+# === Web Framework ===
+fastapi
+uvicorn[standard]
+python-multipart
+
+# === LLM & Agent Framework ===
+llama-index
+llama-index-llms-openai-like
+llama-index-storage-chat-store-sqlite
+
+# === Configuration & Settings ===
+pydantic
+pydantic-settings
+
+# === Database ===
+sqlalchemy
+alembic
+
+# === HTTP & Network ===
+httpx
+requests
+
+# === Environment Management ===
+python-dotenv
+
+# === Retry & Error Handling ===
+tenacity
+
+# === Logging ===
+python-json-logger
+
+# === Development & Testing ===
+pytest
+pytest-asyncio
+black
+flake8
