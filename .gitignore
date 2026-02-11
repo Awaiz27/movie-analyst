@@ -70,3 +70,5 @@ htmlcov/
 *.bak
 *.tmp
 *.temp
+
+.ARCHITECTURE.md

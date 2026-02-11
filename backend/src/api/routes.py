@@ -6,7 +6,7 @@ import uuid
 import json
 from typing import Optional, AsyncGenerator
 
-from src.services.agent import get_agent_for_session
+from src.services.agent import submit_agent_task, drop_session, get_active_tasks, cancel_session_tasks
 from src.schemas.chat import (
     ChatRequest,
     ChatResponse,
@@ -14,9 +14,8 @@ from src.schemas.chat import (
     ErrorResponse
 )
 from src.core.logger import get_logger
-from src.core.db import SessionLocal
+from src.core.db import SessionLocal, ChatMessage, ChatSession
 from src.services.tool import NotFoundError, APIError
-from llama_index.core.workflow import Context
 
 
 logger = get_logger("routes")
@@ -24,52 +23,29 @@ router = APIRouter()
 
 
 async def stream_chat_response(
-    agent, 
-    message: str, 
-    session_id: str, 
+    task: asyncio.Task,
+    session_id: str,
     request_id: str,
-    memory
 ) -> AsyncGenerator[str, None]:
     """Stream agent response as SSE events.
-    
-    ReActAgent emits workflow events (AgentStream for text deltas,
-    ToolCallResult for tool outputs, etc.) via stream_events().
-    We forward text deltas to the client. If no deltas are emitted
+
+    The actual agent work runs inside *task* (a background ``asyncio.Task``).
+    ``asyncio.shield`` ensures the task keeps running even if this generator
+    is cancelled (e.g. the user switches to another chat and the SSE
+    connection is dropped).  The agent will finish, and the response will
+    be written into session Memory automatically.
     """
     try:
         logger.info(f"[{request_id}] Starting streaming response")
-        sent_any = False
-        
-        ctx = Context(agent)
-        handler = agent.run(message, memory=memory, ctx=ctx, max_iterations=10)
-        
-        # async for event in handler.stream_events():
-        #     evt_type = type(event).__name__
-            
-        #     # AgentStream events carry text deltas
-        #     if hasattr(event, 'delta') and event.delta:
-        #         delta = str(event.delta)
-        #         if delta.strip():
-        #             sent_any = True
-        #             yield f"data: {json.dumps({'content': delta, 'session_id': session_id})}\n\n"
-            
-            # # ToolCallResult — optionally notify the client that a tool ran
-            # elif hasattr(event, 'tool_name') and hasattr(event, 'tool_output'):
-            #     tool_msg = f"\n🔧 *Used {event.tool_name}*\n"
-            #     yield f"data: {json.dumps({'content': tool_msg, 'session_id': session_id})}\n\n"
-            #     sent_any = True
-        
-        # Get the final aggregated response
-        final_response = await handler
-        final_text = str(final_response).strip()
-        logger.debug(f"[{request_id}] Final response ({len(final_text)} chars): {final_text[:120]}...")
 
-        #    if not sent_any and final_text:
-        #     # No deltas emitted — send the whole answer
-        #     yield f"data: {json.dumps({'content': final_text, 'session_id': session_id, 'done': True})}\n\n"
-        # else:
-        #     yield f"data: {json.dumps({'session_id': session_id, 'done': True})}\n\n"
-        
+        # shield() prevents the task from being cancelled when FastAPI
+        # cancels this generator on client disconnect.
+        final_text = await asyncio.shield(task)
+
+        logger.debug(
+            f"[{request_id}] Final response ({len(final_text)} chars): "
+            f"{final_text[:120]}..."
+        )
 
         if final_text:
             # Stream word-by-word for a natural typing feel
@@ -82,8 +58,16 @@ async def stream_chat_response(
                 await asyncio.sleep(0.03)
 
         yield f"data: {json.dumps({'session_id': session_id, 'done': True})}\n\n"
-        logger.info(f"[{request_id}] ✓ Streaming completed")
-        
+        logger.info(f"[{request_id}] Streaming completed")
+
+    except asyncio.CancelledError:
+        # Client disconnected — the shielded task continues in the background
+        # and will write its response into Memory when done.
+        logger.info(
+            f"[{request_id}] Client disconnected, agent task continues "
+            f"in background for session {session_id}"
+        )
+
     except Exception as e:
         logger.error(f"[{request_id}] Streaming error: {e}", exc_info=True)
         friendly = "Something went wrong — please check the server and try again."
@@ -109,11 +93,17 @@ async def chat_handler(
     
     try:
         selected_model = req.model or None  # None will use default from settings
-        agent, memory = await get_agent_for_session(req.session_id, model=selected_model)
-        
+
+        # Submit agent work as a background asyncio.Task.
+        # The task survives client disconnects — if the user switches
+        # sessions the response still completes and is saved to Memory.
+        task = await submit_agent_task(
+            req.session_id, req.message, model=selected_model
+        )
+
         if req.stream:
             return StreamingResponse(
-                stream_chat_response(agent, req.message, req.session_id, request_id, memory),
+                stream_chat_response(task, req.session_id, request_id),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -121,21 +111,16 @@ async def chat_handler(
                     "X-Accel-Buffering": "no",  # disable nginx buffering
                 },
             )
-        
-        # Run agent with message (non-streaming)
-        logger.debug(f"[{request_id}] Invoking agent (model: {selected_model or 'default'})...")
-        handler = agent.run(req.message, memory=memory, max_iterations=10)
-        response = await handler
-        
-        response_text = str(response).strip()
-        
-        chat_response = ChatResponse(
+
+        # Non-streaming: await the background task directly
+        logger.debug(f"[{request_id}] Awaiting agent task (model: {selected_model or 'default'})...")
+        response_text = await task
+
+        logger.info(f"[{request_id}] Chat completed successfully")
+        return ChatResponse(
             content=response_text,
-            session_id=req.session_id
+            session_id=req.session_id,
         )
-        
-        logger.info(f"[{request_id}] ✓ Chat completed successfully")
-        return chat_response
         
     except NotFoundError as e:
         logger.warning(f"[{request_id}] Resource not found: {e}")
@@ -173,8 +158,7 @@ async def create_session(x_request_id: Optional[str] = Header(None)) -> SessionC
         
         # Initialize session in database
         db = SessionLocal()
-        from ..core.db import ChatSession
-        
+
         session = ChatSession(
             id=new_session_id,
             title=f"Cinematic Discussion {new_session_id[:8]}"
@@ -211,8 +195,7 @@ async def get_session_info(
         logger.debug(f"[{request_id}] Fetching session: {session_id}")
         
         db = SessionLocal()
-        from ..core.db import ChatSession
-        
+
         session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
         db.close()
         
@@ -247,19 +230,188 @@ async def delete_session(
         logger.info(f"[{request_id}] Deleting session: {session_id}")
         
         db = SessionLocal()
-        from ..core.db import ChatSession
-        
+
+        # Cascade: delete messages first, then session
+        db.query(ChatMessage).filter(ChatMessage.session_id == session_id).delete()
         session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
         if session:
             db.delete(session)
-            db.commit()
-        
+        db.commit()
         db.close()
+
+        # Cancel any running background tasks for this session
+        drop_session(session_id)
         
-        logger.info(f"[{request_id}] ✓ Session deleted: {session_id}")
+        logger.info(f"[{request_id}] Session deleted: {session_id}")
         
         return {"status": "deleted", "session_id": session_id}
         
     except Exception as e:
         logger.error(f"[{request_id}] Failed to delete session: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete session")
+
+
+@router.get("/session/{session_id}/messages")
+async def get_session_messages(
+    session_id: str,
+    x_request_id: Optional[str] = Header(None),
+):
+    """
+    Retrieve all messages for a session from the database.
+
+    Returns the full conversation history ordered by creation time.
+    Use this when the user switches back to a previous session so the
+    frontend can display the entire chat.
+    """
+    request_id = x_request_id or str(uuid.uuid4())
+
+    try:
+        logger.debug(f"[{request_id}] Fetching messages for session: {session_id}")
+
+        db = SessionLocal()
+        rows = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at.asc())
+            .all()
+        )
+        messages = [
+            {
+                "id": r.id,
+                "role": r.role,
+                "content": r.content,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+        db.close()
+
+        return {"session_id": session_id, "messages": messages}
+
+    except Exception as e:
+        logger.error(f"[{request_id}] Error fetching messages: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch messages")
+
+
+@router.get("/sessions")
+async def list_sessions(x_request_id: Optional[str] = Header(None)):
+    """
+    List all chat sessions with message counts.
+
+    Used by the frontend to rebuild the conversation list from the DB
+    on page load / refresh.
+    """
+    request_id = x_request_id or str(uuid.uuid4())
+    try:
+        db = SessionLocal()
+        sessions = db.query(ChatSession).order_by(ChatSession.created_at.desc()).all()
+        result = []
+        for s in sessions:
+            msg_count = (
+                db.query(ChatMessage)
+                .filter(ChatMessage.session_id == s.id)
+                .count()
+            )
+            result.append({
+                "session_id": s.id,
+                "title": s.title,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "message_count": msg_count,
+            })
+        db.close()
+        return {"sessions": result}
+    except Exception as e:
+        logger.error(f"[{request_id}] Error listing sessions: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list sessions")
+
+
+@router.delete("/session/{session_id}/messages")
+async def clear_session_messages(
+    session_id: str,
+    x_request_id: Optional[str] = Header(None),
+):
+    """
+    Delete all messages for a session (clear chat) without deleting
+    the session itself.
+    """
+    request_id = x_request_id or str(uuid.uuid4())
+    try:
+        db = SessionLocal()
+        deleted = (
+            db.query(ChatMessage)
+            .filter(ChatMessage.session_id == session_id)
+            .delete()
+        )
+        db.commit()
+        db.close()
+        logger.info(f"[{request_id}] Cleared {deleted} messages for session {session_id}")
+        return {"status": "cleared", "session_id": session_id, "deleted": deleted}
+    except Exception as e:
+        logger.error(f"[{request_id}] Error clearing messages: {e}")
+        raise HTTPException(status_code=500, detail="Failed to clear messages")
+
+
+@router.patch("/session/{session_id}")
+async def update_session(
+    session_id: str,
+    body: dict,
+    x_request_id: Optional[str] = Header(None),
+):
+    """
+    Update session metadata (e.g. title).
+    """
+    request_id = x_request_id or str(uuid.uuid4())
+    try:
+        db = SessionLocal()
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            db.close()
+            raise HTTPException(status_code=404, detail="Session not found")
+        if "title" in body:
+            session.title = body["title"]
+        db.commit()
+        db.close()
+        return {"status": "updated", "session_id": session_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Error updating session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update session")
+
+
+@router.get("/session/{session_id}/status")
+async def get_session_status(
+    session_id: str,
+    x_request_id: Optional[str] = Header(None),
+):
+    """
+    Check whether the agent has a running background task for this session.
+
+    The frontend polls this to know when to refresh messages after the
+    user navigates away from a chat that was still generating.
+    """
+    running = get_active_tasks(session_id)
+    return {
+        "session_id": session_id,
+        "pending": len(running) > 0,
+        "task_count": len(running),
+    }
+
+
+@router.post("/session/{session_id}/cancel")
+async def cancel_session(
+    session_id: str,
+    x_request_id: Optional[str] = Header(None),
+):
+    """
+    Cancel all running background tasks for this session.
+
+    Called by the frontend when a timeout is reached — stops the agent
+    so it doesn't keep consuming resources for a request the user has
+    already abandoned.
+    """
+    cancelled = cancel_session_tasks(session_id)
+    return {
+        "session_id": session_id,
+        "cancelled": cancelled,
+    }

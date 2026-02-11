@@ -8,6 +8,8 @@ import os
 import uuid
 import logging
 import json
+import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -61,39 +63,68 @@ _CSS_PATH = Path(__file__).parent / "static" / "style.css"
 st.markdown(f"<style>{_CSS_PATH.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 
 def _save_conversations() -> None:
-    """Persist conversations dict to disk."""
+    """Persist local settings to disk. Messages live in the backend DB."""
     try:
         payload = {
-            "conversations": st.session_state.conversations,
             "active_conv": st.session_state.active_conv,
             "selected_model": st.session_state.selected_model,
             "use_streaming": st.session_state.use_streaming,
         }
         _CONV_FILE.write_text(json.dumps(payload, default=str), encoding="utf-8")
     except Exception as exc:
-        logger.warning("Failed to save conversations: %s", exc)
+        logger.warning("Failed to save settings: %s", exc)
 
 
 def _load_conversations() -> None:
-    """Load conversations from disk into session_state (once per session)."""
+    """Load sessions from backend DB + local settings from disk."""
+    # ── Local settings (model, streaming, last active session) ──
+    local = {}
     if _CONV_FILE.exists():
         try:
-            data = json.loads(_CONV_FILE.read_text(encoding="utf-8"))
-            st.session_state.conversations = data.get("conversations", {})
-            st.session_state.active_conv = data.get("active_conv")
-            st.session_state.selected_model = data.get("selected_model", "auto")
-            st.session_state.use_streaming = data.get("use_streaming", True)
-            # Validate active_conv still exists
-            if st.session_state.active_conv not in st.session_state.conversations:
-                st.session_state.active_conv = None
-            return
+            local = json.loads(_CONV_FILE.read_text(encoding="utf-8"))
         except Exception as exc:
-            logger.warning("Failed to load conversations: %s", exc)
-    # Defaults
-    st.session_state.conversations = {}
-    st.session_state.active_conv = None
-    st.session_state.selected_model = "auto"
-    st.session_state.use_streaming = True
+            logger.warning("Failed to load settings file: %s", exc)
+
+    st.session_state.selected_model = local.get("selected_model", "auto")
+    st.session_state.use_streaming = local.get("use_streaming", True)
+
+    # ── Build conversation list from backend DB ──
+    sessions = fetch_sessions()
+    conversations = {}
+    for s in sessions:
+        sid = s["session_id"]
+        conversations[sid] = {
+            "session_id": sid,
+            "messages": [],
+            "title": s.get("title", "New Chat"),
+            "created_at": s.get("created_at", ""),
+            "model": st.session_state.selected_model,
+            "message_count": s.get("message_count", 0),
+        }
+
+    st.session_state.conversations = conversations
+
+    # Restore active conversation from last session
+    prev_active = local.get("active_conv")
+    if prev_active and prev_active in conversations:
+        st.session_state.active_conv = prev_active
+    elif conversations:
+        st.session_state.active_conv = next(iter(conversations))
+    else:
+        st.session_state.active_conv = None
+
+    # Load messages for the active conversation from the DB
+    if st.session_state.active_conv:
+        sid = st.session_state.active_conv
+        db_msgs = fetch_messages(sid)
+        local_msgs = conversations[sid].get("messages", [])
+        conversations[sid]["messages"] = (
+            db_msgs if len(db_msgs) >= len(local_msgs) else local_msgs
+        )
+        msgs = conversations[sid]["messages"]
+        # Derive title from first user message if still generic
+        if msgs and conversations[sid]["title"] in ("New Chat", f"New Chat {sid[:8]}"):
+            conversations[sid]["title"] = _auto_title(msgs)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -146,6 +177,78 @@ def create_new_session() -> Optional[str]:
         st.error(f"Unexpected error: {exc}")
         logger.error("Unexpected error in create_new_session: %s", exc)
     return None
+
+
+def fetch_sessions() -> list[dict]:
+    """Fetch all sessions from the backend DB."""
+    try:
+        resp = requests.get(f"{API_BASE}/sessions", timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("sessions", [])
+    except Exception as exc:
+        logger.warning("Failed to fetch sessions: %s", exc)
+    return []
+
+
+def fetch_messages(session_id: str) -> list[dict]:
+    """Fetch all messages for a session from the backend DB."""
+    try:
+        resp = requests.get(
+            f"{API_BASE}/session/{session_id}/messages",
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            msgs = resp.json().get("messages", [])
+            return [{"role": m["role"], "content": m["content"]} for m in msgs]
+    except Exception as exc:
+        logger.warning("Failed to fetch messages for %s: %s", session_id, exc)
+    return []
+
+
+def check_session_pending(session_id: str) -> bool:
+    """Return True if the backend has a running agent task for this session."""
+    try:
+        resp = requests.get(
+            f"{API_BASE}/session/{session_id}/status",
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("pending", False)
+    except Exception as exc:
+        logger.warning("Failed to check status for %s: %s", session_id, exc)
+    return False
+
+
+def cancel_agent_task(session_id: str) -> None:
+    """Ask the backend to cancel running tasks for a session (timeout)."""
+    try:
+        requests.post(f"{API_BASE}/session/{session_id}/cancel", timeout=5)
+    except Exception as exc:
+        logger.warning("Failed to cancel task for %s: %s", session_id, exc)
+
+
+# Maximum seconds to wait for the agent before showing a timeout message
+_AGENT_TIMEOUT_SECONDS = 90
+
+
+def _fire_agent_request(
+    session_id: str, message: str, model: str
+) -> None:
+    """Send POST /chat in a background thread (fire-and-forget).
+
+    The backend saves the user message to DB immediately and launches the
+    agent as a background task. The frontend poller will pick up the
+    assistant reply from the DB when it's ready — no need to block here.
+    """
+    try:
+        requests.post(
+            f"{API_BASE}/chat",
+            json={"session_id": session_id, "message": message, "model": model, "stream": False},
+            timeout=180,
+            headers={"x-request-id": str(uuid.uuid4())},
+        )
+    except Exception as exc:
+        logger.warning("Background agent request failed for %s: %s", session_id, exc)
 
 
 def send_message(
@@ -243,15 +346,15 @@ def _create_conv_with_prompt(prompt_text: str = None):
     """Create a new conversation and optionally set a pending prompt."""
     sid = create_new_session()
     if sid:
-        conv_id = str(uuid.uuid4())
-        st.session_state.conversations[conv_id] = {
+        st.session_state.conversations[sid] = {
             "session_id": sid,
             "messages": [],
             "title": "New Chat",
             "created_at": datetime.now().strftime("%b %d, %H:%M"),
             "model": st.session_state.selected_model,
+            "message_count": 0,
         }
-        st.session_state.active_conv = conv_id
+        st.session_state.active_conv = sid
         if prompt_text:
             st.session_state.pending_prompt = prompt_text
         _save_conversations()
@@ -262,6 +365,71 @@ def _create_conv_with_prompt(prompt_text: str = None):
 def _active() -> Optional[dict]:
     cid = st.session_state.active_conv
     return st.session_state.conversations.get(cid) if cid else None
+
+
+# ---------------------------------------------------------------------------
+# Auto-refresh poller — renders inline, replaces thinking with response
+# ---------------------------------------------------------------------------
+@st.fragment(run_every=3)
+def _poll_for_updates():
+    """
+    Lightweight fragment that re-executes every 3 seconds.
+
+    It renders the "thinking" indicator OR the completed assistant response
+    inside its own boundary — no full-page st.rerun().
+
+    Timeout: after _AGENT_TIMEOUT_SECONDS the backend task is cancelled
+    and a timeout message is shown.
+    """
+    active = _active()
+    if not active or not active.get("messages"):
+        return
+
+    last = active["messages"][-1]
+
+    # Already have the assistant reply — render it and stop
+    if last["role"] == "assistant":
+        return
+
+    # --- We are waiting for the assistant ---
+    sid = active["session_id"]
+
+    # Check how long we've been waiting
+    wait_key = f"_wait_start_{sid}"
+    if wait_key not in st.session_state:
+        st.session_state[wait_key] = time.time()
+    elapsed = time.time() - st.session_state[wait_key]
+
+    # Poll DB for new messages
+    db_msgs = fetch_messages(sid)
+
+    if len(db_msgs) > len(active["messages"]):
+        # The assistant reply arrived — update local state
+        active["messages"] = db_msgs
+        _save_conversations()
+        st.session_state.pop(wait_key, None)
+        # Single rerun so the main message loop picks up the new reply.
+        st.rerun()
+        return
+
+    # Timeout reached — cancel the background task and show error
+    if elapsed >= _AGENT_TIMEOUT_SECONDS:
+        cancel_agent_task(sid)
+        timeout_msg = (
+            "⏱️ The agent took too long to respond and was stopped. "
+            "Please try again."
+        )
+        active["messages"].append({"role": "assistant", "content": timeout_msg})
+        _save_conversations()
+        st.session_state.pop(wait_key, None)
+        # Single rerun so the timeout message renders in the main loop
+        st.rerun()
+        return
+
+    # Still waiting — show thinking indicator with elapsed time
+    secs = int(elapsed)
+    with st.chat_message("assistant", avatar="🎬"):
+        st.markdown(f"⏳ *Thinking… ({secs}s)*")
 
 backend_ok = check_backend_health()
 
@@ -293,15 +461,15 @@ with st.sidebar:
     if st.button("＋  New Conversation", use_container_width=True, key="new_conv"):
         sid = create_new_session()
         if sid:
-            conv_id = str(uuid.uuid4())
-            st.session_state.conversations[conv_id] = {
+            st.session_state.conversations[sid] = {
                 "session_id": sid,
                 "messages": [],
                 "title": "New Chat",
                 "created_at": datetime.now().strftime("%b %d, %H:%M"),
                 "model": st.session_state.selected_model,
+                "message_count": 0,
             }
-            st.session_state.active_conv = conv_id
+            st.session_state.active_conv = sid
             _save_conversations()
             st.rerun()
 
@@ -312,16 +480,80 @@ with st.sidebar:
         for cid in reversed(list(convos.keys())):
             c = convos[cid]
             is_active = cid == st.session_state.active_conv
-            n_msgs = len([m for m in c["messages"] if m["role"] == "user"])
+            n_msgs = (
+                len([m for m in c["messages"] if m["role"] == "user"])
+                if c["messages"]
+                else c.get("message_count", 0) // 2
+            )
             title = c.get("title", "New Chat")
-            if st.button(
-                f"{'▸ ' if is_active else '  '}{title}  ({n_msgs})",
-                key=f"conv_{cid}",
-                use_container_width=True,
-            ):
-                st.session_state.active_conv = cid
-                _save_conversations()
-                st.rerun()
+
+            # ── Row: [select button] [actions popover] ──
+            col_sel, col_act = st.columns([9, 1])
+            with col_sel:
+                prefix = "\u25b8 " if is_active else "  "
+                line = f"{prefix}{title}  ({n_msgs})"
+                if st.button(
+                    line,
+                    key=f"conv_{cid}",
+                    use_container_width=True,
+                ):
+                    st.session_state.active_conv = cid
+                    # Fetch from DB, but keep local copy if it has more
+                    # messages (e.g. background task hasn't flushed yet)
+                    db_msgs = fetch_messages(c["session_id"])
+                    local_msgs = convos[cid].get("messages", [])
+                    convos[cid]["messages"] = (
+                        db_msgs if len(db_msgs) >= len(local_msgs) else local_msgs
+                    )
+                    _save_conversations()
+                    st.rerun()
+            with col_act:
+                with st.popover("⋮", use_container_width=True):
+                    if st.button("✏️ Rename", key=f"ren_{cid}", use_container_width=True):
+                        st.session_state["renaming_conv"] = cid
+                        st.rerun()
+                    if st.button("🗑️ Delete", key=f"del_{cid}", use_container_width=True):
+                        try:
+                            requests.delete(f"{API_BASE}/session/{cid}", timeout=10)
+                        except Exception:
+                            pass
+                        del st.session_state.conversations[cid]
+                        if st.session_state.active_conv == cid:
+                            remaining = list(st.session_state.conversations.keys())
+                            st.session_state.active_conv = remaining[-1] if remaining else None
+                        _save_conversations()
+                        st.rerun()
+
+        renaming = st.session_state.get("renaming_conv")
+        if renaming and renaming in convos:
+            st.markdown("---")
+            new_title = st.text_input(
+                "Rename conversation",
+                value=convos[renaming].get("title", ""),
+                key="rename_input",
+                max_chars=60,
+            )
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                if st.button("Save", key="rename_save", use_container_width=True):
+                    new_title = new_title.strip()
+                    if new_title:
+                        convos[renaming]["title"] = new_title
+                        try:
+                            requests.patch(
+                                f"{API_BASE}/session/{renaming}",
+                                json={"title": new_title},
+                                timeout=5,
+                            )
+                        except Exception:
+                            pass
+                    st.session_state.pop("renaming_conv", None)
+                    _save_conversations()
+                    st.rerun()
+            with rc2:
+                if st.button("Cancel", key="rename_cancel", use_container_width=True):
+                    st.session_state.pop("renaming_conv", None)
+                    st.rerun()
     else:
         st.markdown(
             "<div style='padding:1rem .4rem;text-align:center;color:rgba(255,255,255,.3);"
@@ -379,6 +611,13 @@ with st.sidebar:
             with st.container():
                 st.markdown("<div class='secondary-btn'>", unsafe_allow_html=True)
                 if st.button("Clear Chat", use_container_width=True, key="clear_chat"):
+                    try:
+                        requests.delete(
+                            f"{API_BASE}/session/{active['session_id']}/messages",
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
                     active["messages"] = []
                     active["title"] = "New Chat"
                     _save_conversations()
@@ -389,6 +628,13 @@ with st.sidebar:
                 st.markdown("<div class='secondary-btn'>", unsafe_allow_html=True)
                 if st.button("Delete Chat", use_container_width=True, key="del_chat"):
                     cid = st.session_state.active_conv
+                    try:
+                        requests.delete(
+                            f"{API_BASE}/session/{cid}",
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
                     del st.session_state.conversations[cid]
                     remaining = list(st.session_state.conversations.keys())
                     st.session_state.active_conv = remaining[-1] if remaining else None
@@ -414,37 +660,48 @@ if active is not None:
             with st.chat_message(msg["role"], avatar="🧑‍💻" if msg["role"] == "user" else "🎬"):
                 st.markdown(msg["content"])
 
-        user_input = st.chat_input("Ask about any movie, show, or cinematic topic…")
+        # ── The fragment handles thinking indicator + auto-update inline ──
+        _poll_for_updates()
+
+        # Disable input while waiting for the agent to respond
+        waiting = (
+            bool(active["messages"])
+            and active["messages"][-1]["role"] == "user"
+        )
+        user_input = st.chat_input(
+            "Waiting for response…" if waiting else "Ask about any movie, show, or cinematic topic…",
+            disabled=waiting,
+        )
         prompt = pending or user_input
 
         if prompt:
             active["messages"].append({"role": "user", "content": prompt})
             if active["title"] == "New Chat":
                 active["title"] = _auto_title(active["messages"])
-
-            with st.chat_message("user", avatar="🧑‍💻"):
-                st.markdown(prompt)
-
-            with st.chat_message("assistant", avatar="🎬"):
-                if st.session_state.use_streaming:
-                    response = send_message(
-                        active["session_id"], prompt,
-                        model=st.session_state.selected_model, use_streaming=True,
+                try:
+                    requests.patch(
+                        f"{API_BASE}/session/{active['session_id']}",
+                        json={"title": active["title"]},
+                        timeout=5,
                     )
-                else:
-                    with st.spinner("Analyzing…"):
-                        response = send_message(
-                            active["session_id"], prompt,
-                            model=st.session_state.selected_model, use_streaming=False,
-                        )
-                    if response:
-                        st.markdown(response)
+                except Exception:
+                    pass
 
-            if response:
-                active["messages"].append({"role": "assistant", "content": response})
-            else:
-                st.warning("No response received — check the backend logs.")
+            # Start the wait timer so the poller shows "Thinking…" immediately
+            wait_key = f"_wait_start_{active['session_id']}"
+            st.session_state[wait_key] = time.time()
+
+            # Fire backend request in a background thread (non-blocking).
+            # The backend saves the user msg to DB and starts the agent.
+            # The poller will pick up the assistant reply when ready.
+            threading.Thread(
+                target=_fire_agent_request,
+                args=(active["session_id"], prompt, st.session_state.selected_model),
+                daemon=True,
+            ).start()
+
             _save_conversations()
+            st.rerun()  # Immediately re-render → poller shows "Thinking…"
 
     else:
         st.markdown("<div style='height:18vh'></div>", unsafe_allow_html=True)

@@ -66,10 +66,9 @@
 |---|---|
 | **Agentic AI** | LlamaIndex ReAct agent with 12 specialized TMDB tools — search, discover, trending, details, similar, recommendations, and more |
 | **Multi-Model** | Concentrate AI gateway with model selection (GPT-4, Claude 3.5, Gemini Pro, etc.) |
-| **Streaming** | Server-sent events (SSE) with word-by-word delivery for real-time response rendering |
+| **Streaming** | Server-sent events (SSE) with word-by-word delivery for real-time response rendering. **Note:** Concentrate AI's streaming API does not return chunks correctly ([see known issues](#concentrate-ai--known-shortcomings)), so the backend mimics streaming — the agent runs to completion, then the full response is split into word batches and emitted as SSE chunks with a small `asyncio.sleep` delay between each. The code is fully wired for native streaming and can switch to true token-by-token output once the upstream API is fixed. |
 | **Multi-Chat** | Parallel conversation sessions with independent history and context |
-| **Persistence** | Conversations saved to disk (JSON) + SQLite session tracking on the backend |
-| **Memory** | In-process `Memory` objects cached per session so the agent retains full conversation context |
+| **Persistence** | All messages persisted to SQLite (WAL mode) via SQLAlchemy — the DB is the single source of truth; the frontend fetches on load |
 | **Cinema UI** | Dark-themed Streamlit interface with suggestion pills, hero landing page, and sidebar navigation |
 | **Docker Ready** | Full `docker-compose.yml` for one-command deployment of backend + frontend |
 | **Retry Logic** | Exponential backoff via Tenacity on all external API calls |
@@ -79,42 +78,47 @@
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Streamlit Frontend                       │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────┐  ┌───────────┐  │
-│  │ Chat UI  │  │ Model Select │  │ Streaming │  │  Sidebar  │  │
-│  └────┬─────┘  └──────┬───────┘  └─────┬─────┘  └───────────┘  │
-│       └───────────────┼────────────────┘                        │
-└───────────────────────┼─────────────────────────────────────────┘
-                        │ HTTP / SSE
-                        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        FastAPI Backend                          │
-│  ┌──────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │  Routes  │  │  Agent Cache │  │   Memory Cache (per      │  │
-│  │ /chat    │──│  (per sess.) │──│   session, in-process)   │  │
-│  │ /session │  └──────┬───────┘  └──────────────────────────┘  │
-│  └──────────┘         │                                         │
-│                       ▼                                         │
-│            ┌─────────────────────┐                              │
-│            │ LlamaIndex ReAct    │                              │
-│            │ Agent (12 tools)    │                              │
-│            └────────┬────────────┘                              │
-│                     │                                           │
-│          ┌──────────┼──────────┐                                │
-│          ▼          ▼          ▼                                 │
-│    ┌──────────┐ ┌────────┐ ┌────────┐                           │
-│    │ TMDB API │ │TVMaze  │ │SQLite  │                           │
-│    └──────────┘ └────────┘ └────────┘                           │
-└─────────────────────────────────────────────────────────────────┘
-                        │
-                        ▼
-            ┌─────────────────────┐
-            │  Concentrate AI     │
-            │  (Multi-LLM Router) │
-            │  GPT-4 │ Claude │   │
-            │  Gemini │ Auto   │  │
-            └─────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                       Streamlit Frontend                         │
+│  ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌────────────────┐  │
+│  │ Chat UI  │ │ Model Select │ │ Sidebar  │ │  Auto-Refresh  │  │
+│  │ (SSE +   │ │ (Concentrate │ │ Rename / │ │  @st.fragment  │  │
+│  │  polling)│ │  providers)  │ │ Delete   │ │  (run_every=3) │  │
+│  └────┬─────┘ └──────┬───────┘ └──────────┘ └───────┬────────┘  │
+│       └──────────────┼──────────────────────────────┘            │
+└──────────────────────┼───────────────────────────────────────────┘
+                       │ HTTP / SSE
+                       ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                       FastAPI Backend                            │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  Routes (/chat, /session, /sessions, /status, /messages) │    │
+│  └──────────┬───────────────────────────────────────────────┘    │
+│             │                                                    │
+│  ┌──────────▼─────────────────────────────┐                      │
+│  │  Agent Orchestrator (agent.py)         │                      │
+│  │  • submit_agent_task() — saves user    │                      │
+│  │    msg to DB, launches background task │                      │
+│  │  • _run_agent_task() — saves assistant │                      │
+│  │    reply to DB on completion           │                      │
+│  │  • asyncio.Task + asyncio.shield       │                      │
+│  └──────────┬─────────────────────────────┘                      │
+│             │                                                    │
+│  ┌──────────▼──────────┐   ┌──────────────────────────────────┐  │
+│  │ LlamaIndex ReAct    │   │  SQLite (WAL mode)               │  │
+│  │ Agent (12 tools)    │   │  chat_sessions + chat_messages   │  │
+│  │ Memory hydrated     │◄──│  Single source of truth          │  │
+│  │ from DB per request │   └──────────────────────────────────┘  │
+│  └──────────┬──────────┘                                         │
+│       ┌─────┼──────┐                                             │
+│       ▼     ▼      ▼                                             │
+│  ┌────────┐┌──────┐┌───────────────────────┐                     │
+│  │TMDB API││TVMaze││  Concentrate AI        │                    │
+│  │ (v3)   ││ API  ││  (Multi-LLM Router)   │                    │
+│  └────────┘└──────┘│  GPT-4 · Claude ·     │                    │
+│                     │  Gemini · Auto        │                    │
+│                     └───────────────────────┘                    │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -199,24 +203,27 @@ movie-analyst/
 │   └── src/
 │       ├── api/
 │       │   ├── main_app.py         # FastAPI app factory
-│       │   └── routes.py           # /chat, /session endpoints
+│       │   └── routes.py           # /chat, /session, /status endpoints
 │       ├── core/
 │       │   ├── config.py           # Pydantic Settings (validated)
-│       │   ├── db.py               # SQLAlchemy + SQLite
+│       │   ├── db.py               # SQLAlchemy + SQLite (WAL mode)
 │       │   └── logger.py           # Structured logging
 │       ├── schemas/
 │       │   └── chat.py             # Request / Response models
 │       └── services/
-│           ├── agent.py            # Agent factory + session cache
+│           ├── agent.py            # Agent orchestrator + background tasks
 │           ├── concentrate_llm.py  # Concentrate AI LLM adapter
 │           └── tool.py             # 12 TMDB / TVMaze tools
 ├── frontend/
-│   ├── app.py                      # Streamlit application
+│   ├── app.py                      # Streamlit application (auto-refresh poller)
 │   ├── Dockerfile
 │   ├── requirements.txt
+│   ├── data/
+│   │   └── conversations.json      # Local settings only (model, active session)
 │   └── static/
 │       └── style.css               # Cinema dark theme
 ├── docker-compose.yml
+├── ARCHITECTURE.md                  # Full backend + frontend technical docs
 └── .gitignore
 ```
 
@@ -258,7 +265,27 @@ Retrieve session metadata.
 
 ### `DELETE /api/v1/session/{session_id}`
 
-Delete a session and its history.
+Delete a session and cascade-delete its messages.
+
+### `GET /api/v1/session/{session_id}/messages`
+
+Retrieve all messages for a session (ordered by creation time).
+
+### `DELETE /api/v1/session/{session_id}/messages`
+
+Clear all messages for a session without deleting the session itself.
+
+### `GET /api/v1/sessions`
+
+List all sessions with message counts.
+
+### `PATCH /api/v1/session/{session_id}`
+
+Update session metadata (e.g. rename title). Body: `{ "title": "New Name" }`.
+
+### `GET /api/v1/session/{session_id}/status`
+
+Check if the agent has a running background task. Returns `{ "pending": true/false }`.
 
 ### `GET /health`
 
@@ -332,7 +359,7 @@ Includes:
 | 2 | **Not OpenAI-compatible out of the box** — The API surface is close, but not fully drop-in compatible with OpenAI-style clients/SDKs, so existing integrations often require code changes and custom wrappers.                                     |
 | 3 | **Cannot fully disable tools** — Tool invocation can’t be cleanly turned off at the gateway level in all scenarios, making it hard to enforce “no-tools” execution for certain environments, tests, or compliance needs.                           |
 | 4 | **`auto` features are unreliable** — The “auto” behavior does not consistently produce expected results (selection/routing/behavior varies), reducing confidence in production use without explicit model pinning.                                 |
-| 5 | Streaming not working as expected — streaming responses returned empty output (no chunks/content) or failed to emit tokens despite successful request initiation   |
+| 5 | **Streaming not working as expected** — streaming responses returned empty output (no chunks/content) or failed to emit tokens despite successful request initiation. **Workaround:** The backend runs the agent to completion first, then mimics streaming by splitting the final response into 3-word batches and emitting them as SSE chunks with a 30 ms `asyncio.sleep` delay between each. The code is fully wired for native streaming and will switch over once the upstream API is fixed. |
 | 6 | **Lack of maintained framework adapters** — No official, maintained adapters for common ecosystems (LlamaIndex, LangChain, Vercel AI SDK, OpenAI Agents SDK compat mode), increasing setup friction and pushing integration burden onto end users. |
 | 7 | **Higher support/maintenance overhead** — Because of compatibility gaps, tooling controls, and streaming variability, teams may need extra glue code, more tests, and more operational debugging compared to more standardized gateways.           |
 
